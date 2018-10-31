@@ -8,9 +8,37 @@ from calamari_ocr.ocr.backends.model_interface import ModelInterface
 from calamari_ocr.proto import LayerParams, NetworkParams
 
 
+def float32_variable_storage_getter(getter, name, shape=None, dtype=None,
+                                    initializer=None, regularizer=None,
+                                    trainable=True,
+                                    *args, **kwargs):
+    """Custom variable getter that forces trainable variables to be stored in
+    float32 precision and then casts them to the training precision.
+    """
+    reuse = kwargs.get('reuse', False)
+    if reuse:
+        try:
+            return getter(name, shape, dtype=dtype, initializer=initializer, regularizer=regularizer,
+                          trainable=trainable,
+                          *args, **kwargs,)
+        except ValueError as err:
+            pass
+
+    storage_dtype = tf.float32 if trainable else dtype
+    variable = getter(name, shape, dtype=storage_dtype,
+                      initializer=initializer, regularizer=regularizer,
+                      trainable=trainable,
+                      *args, **kwargs)
+    if trainable and dtype != tf.float32:
+        variable = tf.cast(variable, dtype)
+    return variable
+
+
 class TensorflowModel(ModelInterface):
     def __init__(self, network_proto, graph, session, graph_type="train", batch_size=1, reuse_weights=False):
         super().__init__(network_proto, graph_type, batch_size, implementation_handles_batching=True)
+        self.dtype = tf.float16
+        self.np_dtype = np.float16 if self.dtype == tf.float16 else np.float32
         self.graph = graph
         self.session = session
         self.gpu_available = any([d.device_type == "GPU" for d in self.session.list_devices()])
@@ -64,7 +92,7 @@ class TensorflowModel(ModelInterface):
         batch_size = tf.shape(inputs)[0]
         gpu_enabled = self.gpu_available
 
-        with tf.variable_scope("cnn_lstm", reuse=reuse_variables) as scope:
+        with tf.variable_scope("cnn_lstm", reuse=reuse_variables, custom_getter=float32_variable_storage_getter, dtype=self.dtype) as scope:
             no_layers = len(network_proto.layers) == 0
             if not no_layers:
                 has_conv_or_pool = network_proto.layers[0].type != LayerParams.LSTM
@@ -131,14 +159,15 @@ class TensorflowModel(ModelInterface):
 
                 def cpu_cudnn_compatible_lstm_backend(time_major_inputs, hidden_nodes):
                     def get_lstm_cell(num_hidden):
-                        return cudnn_rnn.CudnnCompatibleLSTMCell(num_hidden, reuse=reuse_variables)
+                        # return cudnn_rnn.CudnnCompatibleLSTMCell(num_hidden, reuse=reuse_variables)
+                        return tf.contrib.rnn.LSTMBlockCell(num_hidden, reuse=reuse_variables, dtype=self.dtype)
 
                     fw, bw = zip(*[(get_lstm_cell(hidden_nodes), get_lstm_cell(hidden_nodes)) for _ in lstm_layers])
 
                     time_major_outputs, output_fw, output_bw \
                         = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(list(fw), list(bw), time_major_inputs,
                                                                          sequence_length=lstm_seq_len,
-                                                                         dtype=tf.float32,
+                                                                         dtype=self.dtype,
                                                                          scope="cudnn_lstm/stack_bidirectional_rnn",
                                                                          time_major=True,
                                                                          )
@@ -149,7 +178,8 @@ class TensorflowModel(ModelInterface):
                     # Create the Cudnn LSTM factory
                     rnn_lstm = cudnn_rnn.CudnnLSTM(len(lstm_layers), hidden_nodes,
                                                    direction='bidirectional',
-                                                   kernel_initializer=tf.initializers.random_uniform(-0.1, 0.1))
+                                                   kernel_initializer=tf.initializers.random_uniform(-0.1, 0.1, dtype=self.dtype),
+                                                   dtype=self.dtype)
 
                     # TODO: Check if the models are loadable from meta Graph, maybe the next line fixed this
                     rnn_lstm._saveable_cls = cudnn_rnn.CudnnLSTMSaveable
@@ -201,9 +231,11 @@ class TensorflowModel(ModelInterface):
             # DECODER
             # ================================================================
             if network_proto.ctc == NetworkParams.CTC_DEFAULT:
-                decoded, log_prob = ctc_ops.ctc_greedy_decoder(time_major_logits, lstm_seq_len, merge_repeated=network_proto.ctc_merge_repeated)
+                decoded, log_prob = ctc_ops.ctc_greedy_decoder(
+                    tf.cast(time_major_logits, dtype=tf.float32),
+                    lstm_seq_len, merge_repeated=network_proto.ctc_merge_repeated)
             elif network_proto.ctc == NetworkParams.CTC_FUZZY:
-                decoded, log_prob = self.fuzzy_module['decoder_op'](softmax, lstm_seq_len)
+                decoded, log_prob = self.fuzzy_module['decoder_op'](tf.cast(softmax, dtype=tf.float32), lstm_seq_len)
             else:
                 raise Exception("Unknown ctc model: '%s'. Supported are Default and Fuzzy" % network_proto.ctc)
 
@@ -217,16 +249,16 @@ class TensorflowModel(ModelInterface):
             return lstm_seq_len, time_major_logits, time_major_softmax, logits, softmax, decoded, sparse_decoded, factor
 
     def create_placeholders(self):
-        with tf.variable_scope("cnn_lstm", reuse=False) as scope:
-            inputs = tf.placeholder(tf.float32, shape=(None, None, self.network_proto.features), name="inputs")
+        with tf.variable_scope("cnn_lstm", reuse=False, custom_getter=float32_variable_storage_getter) as scope:
+            inputs = tf.placeholder(self.dtype, shape=(None, None, self.network_proto.features), name="inputs")
             seq_len = tf.placeholder(tf.int32, shape=(None,), name="seq_len")
             targets = tf.sparse_placeholder(tf.int32, shape=(None, None), name="targets")
-            dropout_rate = tf.placeholder(tf.float32, shape=(), name="dropout_rate")
+            dropout_rate = tf.placeholder(self.dtype, shape=(), name="dropout_rate")
 
         return inputs, seq_len, targets, dropout_rate
 
     def create_dataset_inputs(self, batch_size, line_height, buffer_size=1000):
-        with tf.variable_scope("cnn_lstm", reuse=False):
+        with tf.variable_scope("cnn_lstm", reuse=False, custom_getter=float32_variable_storage_getter):
             def gen():
                 for i, l in zip(self.raw_images, self.raw_labels):
                     if self.graph_type == "train" and len(l) == 0:
@@ -240,19 +272,19 @@ class TensorflowModel(ModelInterface):
                 shape = tf.shape(labels, out_type=tf.int64)
                 return data / 255, tf.SparseTensor(indices, values, shape), len_data, len_labels
 
-            dataset = tf.data.Dataset.from_generator(gen, (tf.float32, tf.int32, tf.int32, tf.int32))
+            dataset = tf.data.Dataset.from_generator(gen, (self.dtype, tf.int32, tf.int32, tf.int32))
             if self.graph_type == "train":
                 dataset = dataset.repeat().shuffle(buffer_size, seed=self.network_proto.backend.random_seed)
             else:
                 pass
 
             dataset = dataset.padded_batch(batch_size, ([None, line_height], [None], [1], [1]),
-                                           padding_values=(np.float32(0), np.int32(-1), np.int32(0), np.int32(0)))
+                                           padding_values=(self.np_dtype(0), np.int32(-1), np.int32(0), np.int32(0)))
             dataset = dataset.map(convert_to_sparse)
 
             data_initializer = dataset.prefetch(5).make_initializable_iterator()
             inputs = data_initializer.get_next()
-            dropout_rate = tf.placeholder(tf.float32, shape=(), name="dropout_rate")
+            dropout_rate = tf.placeholder(self.dtype, shape=(), name="dropout_rate")
             return inputs[0], tf.reshape(inputs[2], [-1]), inputs[1], dropout_rate, data_initializer
 
     def create_cer(self, decoded, targets):
@@ -269,14 +301,14 @@ class TensorflowModel(ModelInterface):
         # to match the true codec size
         if self.network_proto.ctc == NetworkParams.CTC_DEFAULT:
             loss = ctc_ops.ctc_loss(targets,
-                                    time_major_logits,
+                                    tf.cast(time_major_logits, dtype=tf.float32),
                                     seq_len,
                                     time_major=True,
                                     ctc_merge_repeated=self.network_proto.ctc_merge_repeated,
                                     ignore_longer_outputs_than_inputs=True)
         elif self.network_proto.ctc == NetworkParams.CTC_FUZZY:
             loss, deltas = self.fuzzy_module['module'].fuzzy_ctc_loss(
-                batch_major_logits, targets.indices,
+                tf.cast(batch_major_logits, dtype=tf.float32), targets.indices,
                 targets.values,
                 seq_len,
                 ignore_longer_outputs_than_inputs=True)
@@ -291,10 +323,13 @@ class TensorflowModel(ModelInterface):
         else:
             raise Exception("Unknown solver of type '%s'" % self.network_proto.solver)
 
+        loss_scale_manager = tf.contrib.mixed_precision.FixedLossScaleManager(1)
+        optimizer = tf.contrib.mixed_precision.LossScaleOptimizer(optimizer, loss_scale_manager)
+
         gvs = optimizer.compute_gradients(cost)
 
         training_ops = []
-        if self.network_proto.clipping_mode == NetworkParams.CLIP_NONE:
+        if self.network_proto.clipping_mode == NetworkParams.CLIP_NONE or True:
             pass
         elif self.network_proto.clipping_mode == NetworkParams.CLIP_AUTO:
             # exponentially follow the global average of gradients to set clipping
@@ -303,12 +338,13 @@ class TensorflowModel(ModelInterface):
             max_l2 = 1000
             max_grads = 1000
 
-            grads = [grad for grad, _ in gvs]
+            grads = [tf.cast(grad, tf.float32) for grad, _ in gvs]
             l2 = tf.minimum(tf.global_norm([grad for grad in grads]), max_l2)
             l2_ema_op, l2_ema = ema.apply([l2]), ema.average(l2)
             grads, _ = tf.clip_by_global_norm(grads,
                                               clip_norm=tf.minimum(l2_ema / max_l2 * max_grads, max_grads))
-            gvs = zip(grads, [var for _, var in gvs])
+
+            gvs = [(tf.cast(grad, orig_grad.dtype), var) for grad, (orig_grad, var) in zip(grads, gvs)]
             training_ops.append(l2_ema_op)
         elif self.network_proto.clipping_mode == NetworkParams.CLIP_CONSTANT:
             clip = self.network_proto.clipping_constant
