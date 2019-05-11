@@ -53,6 +53,7 @@ test-cpu-cross-fold-train:
   script:
     - set -e
     - calamari-cross-fold-train --files calamari_ocr/test/data/uw3_50lines/train/*.png --n_folds 3 --best_models_dir tmp_best_models --max_iters 10
+    - calamari-cross-fold-train --no_spawn --files calamari_ocr/test/data/uw3_50lines/train/*.png --n_folds 3 --best_models_dir tmp_best_models --max_iters 10
 
 test-cpu-cross-fold-train-augmentation:
   stage: test
@@ -73,6 +74,7 @@ test-cpu-cross-fold-train-preload5:
     - set -e
     - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-cross-fold-train --weights calamari_models/antiqua_modern/0.ckpt.json calamari_models/antiqua_modern/1.ckpt.json calamari_models/antiqua_modern/2.ckpt.json calamari_models/antiqua_modern/3.ckpt.json calamari_models/antiqua_modern/4.ckpt.json --files calamari_ocr/test/data/uw3_50lines/train/*.png --n_folds 5 --best_models_dir tmp_best_models --max_iters 10
+    - calamari-cross-fold-train --no_spawn --weights calamari_models/antiqua_modern/0.ckpt.json calamari_models/antiqua_modern/1.ckpt.json calamari_models/antiqua_modern/2.ckpt.json calamari_models/antiqua_modern/3.ckpt.json calamari_models/antiqua_modern/4.ckpt.json --files calamari_ocr/test/data/uw3_50lines/train/*.png --n_folds 5 --best_models_dir tmp_best_models --max_iters 10
 
 
 # prediction and evaluation including voting

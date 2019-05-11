@@ -47,6 +47,12 @@ def main(args=None):
                                  "from scratch")
         parser.add_argument("--single_fold", type=int, nargs="+", default=[],
                             help="Only train a single (list of single) specific fold(s).")
+        parser.add_argument("--no_spawn", action="store_true", default=False,
+                            help="By default each fold is launched in a completely new python process. "
+                                 "Setting this flag all processes are hold in the the paren environment. "
+                                 "Use this for instance if you are using slurm on the cross-fold-train script and not "
+                                 "via the --run parameter."
+                            )
 
         # add the training args (omit those params, that are set by the cross fold training)
         setup_train_args(parser, omit=["files", "validation", "weights",
@@ -78,6 +84,7 @@ def main(args=None):
     trainer.run(
         args.single_fold, seed=args.seed, weights=args.weights, max_parallel_models=args.max_parallel_models,
         temporary_dir=args.temporary_dir, keep_temporary_files=args.keep_temporary_files,
+        spawn_subprocesses=not args.no_spawn,
     )
 
 

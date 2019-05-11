@@ -3,6 +3,9 @@ import os
 import inspect
 import json
 import tempfile
+import logging
+
+logger = logging.getLogger(__name__)
 
 from calamari_ocr.ocr import CrossFold
 from calamari_ocr.utils.multiprocessing import prefix_run_command, run
@@ -18,15 +21,23 @@ def train_individual_model(run_args):
     #       skeduler to train all folds on different machines
     args = run_args["args"]
     train_args_json = run_args["json"]
-    for line in run(prefix_run_command([
-        "python3", "-u",
-        args["train_script"],
-        "--files", train_args_json,
+    if run_args["spawn_subprocess"]:
+        for line in run(prefix_run_command([
+            "python3", "-u",
+            args["train_script"],
+            "--files", train_args_json,
 
-    ], args.get("run", None), {"threads": args.get('num_threads', -1)}), verbose=args.get("verbose", False)):
-        # Print the output of the thread
-        if args.get("verbose", False):
-            print("FOLD {} | {}".format(args["id"], line), end="")
+        ], args.get("run", None), {"threads": args.get('num_threads', -1)}), verbose=args.get("verbose", False)):
+            # Print the output of the thread
+            if args.get("verbose", False):
+                print("FOLD {} | {}".format(args["id"], line), end="")
+    else:
+        import calamari_ocr.scripts.train as train
+        from argparse import ArgumentParser
+        parser = ArgumentParser()
+        train.setup_train_args(parser)
+        args = parser.parse_args(['--files', train_args_json])
+        train.run(args)
 
     return args
 
@@ -57,8 +68,16 @@ class CrossFoldTrainer:
             raise TypeError("Train args must be type of dict")
 
     def run(self, single_fold=None, seed=-1, weights=None, max_parallel_models=-1,
-            temporary_dir=None, keep_temporary_files=False,
+            temporary_dir=None, keep_temporary_files=False, spawn_subprocesses=True,
             ):
+        if not spawn_subprocesses and "run" in self.train_args and self.train_args['run']:
+            logger.warning("The --run parameter is ignored because no new threads are spawned.")
+        if not spawn_subprocesses and not (max_parallel_models == 1 or max_parallel_models == -1):
+            logging.warning("If no processes are spawned only one model can be computed at the same time")
+
+        if not spawn_subprocesses:
+            max_parallel_models = 1
+
         # Default params
         single_fold = single_fold if single_fold else []
         weights = weights if weights else []
@@ -141,12 +160,18 @@ class CrossFoldTrainer:
                     indent=4,
                 )
 
-            run_args.append({"json": path, "args": fold_args})
+            run_args.append(
+                {"json": path,
+                 "spawn_subprocess": spawn_subprocesses,
+                 "args": fold_args})
 
         # Launch the individual processes for each training
-        with multiprocessing.Pool(processes=max_parallel_models) as pool:
-            # workaround to forward keyboard interrupt
-            pool.map_async(train_individual_model, run_args).get(999999999)
+        if max_parallel_models == 1:
+            list(map(train_individual_model, run_args))
+        else:
+            with multiprocessing.Pool(processes=max_parallel_models) as pool:
+                # workaround to forward keyboard interrupt
+                pool.map_async(train_individual_model, run_args).get(999999999)
 
         if not keep_temporary_files:
             import shutil
